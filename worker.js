@@ -1,211 +1,224 @@
-const config = {
-    no_ref: "off", //Control the HTTP referrer header, if you want to create an anonymous link that will hide the HTTP Referer header, please set to "on" .
-    theme:"",//Homepage theme, use the empty value for default theme. To use urlcool theme, please fill with "theme/urlcool" .
-    cors: "on",//Allow Cross-origin resource sharing for API requests.
-    unique_link:true,//If it is true, the same long url will be shorten into the same short url
-    custom_link:false,//Allow users to customize the short url.
-    safe_browsing_api_key: "" //Enter Google Safe Browsing API Key to enable url safety check before redirect.
+// u.bo.ge URL shortener
+// - Public:  GET /<code>           -> 302 redirect (existing + new links stay open)
+// - Locked:  /admin, /admin/api/*  -> requires Cloudflare Access login (JWT verified here too)
+// KV format is unchanged from the old worker: LINKS[<code>] = <long url>,
+// LINKS[sha512(<long url>)] = <code> (de-dup index).
+
+const CODE_RE = /^[A-Za-z0-9]{4,16}$/;
+const CODE_CHARS = "ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678";
+
+// Destinations we refuse: other shorteners (used to hide the real target)
+// and free dynamic-DNS providers (heavily used for phishing).
+const BLOCKED_HOST_SUFFIXES = [
+  // shorteners
+  "uurl.at", "bit.ly", "tinyurl.com", "t.co", "is.gd", "v.gd", "cutt.ly", "rb.gy",
+  "shorturl.at", "ow.ly", "t.ly", "tiny.cc", "rebrand.ly", "s.id", "shorturl.asia",
+  "goo.su", "clck.ru", "qrco.de", "bl.ink", "short.io", "linktr.ee",
+  // dynamic DNS / free subdomain hosts
+  "twilightparadox.com", "mooo.com", "afraid.org", "duckdns.org", "no-ip.org",
+  "ddns.net", "hopto.org", "zapto.org", "servebeer.com", "sytes.net", "dynu.net",
+  "freedns.org", "chickenkiller.com", "strangled.net", "ignorelist.com", "crabdance.com",
+  "ngrok.io", "ngrok-free.app", "trycloudflare.com", "serveo.net", "loca.lt",
+  // this shortener itself (no loops)
+  "u.bo.ge",
+];
+
+// ---------- Cloudflare Access JWT verification ----------
+let certCache = { keys: null, fetchedAt: 0 };
+
+function b64urlToBytes(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+async function getAccessKeys(teamDomain) {
+  if (certCache.keys && Date.now() - certCache.fetchedAt < 10 * 60 * 1000) return certCache.keys;
+  const res = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`);
+  if (!res.ok) throw new Error("certs fetch failed");
+  const { keys } = await res.json();
+  certCache = { keys, fetchedAt: Date.now() };
+  return keys;
+}
+
+async function verifyAccess(request, env) {
+  const token =
+    request.headers.get("Cf-Access-Jwt-Assertion") ||
+    (request.headers.get("Cookie") || "").match(/(?:^|;\s*)CF_Authorization=([^;]+)/)?.[1];
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  let header, payload;
+  try {
+    header = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[0])));
+    payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[1])));
+  } catch {
+    return null;
+  }
+  if (header.alg !== "RS256") return null;
+  const jwk = (await getAccessKeys(env.ACCESS_TEAM_DOMAIN)).find((k) => k.kid === header.kid);
+  if (!jwk) return null;
+  const key = await crypto.subtle.importKey(
+    "jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]
+  );
+  const ok = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5", key, b64urlToBytes(parts[2]),
+    new TextEncoder().encode(`${parts[0]}.${parts[1]}`)
+  );
+  if (!ok) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  if (!aud.includes(env.ACCESS_AUD)) return null;
+  if (payload.iss !== `https://${env.ACCESS_TEAM_DOMAIN}`) return null;
+  if (typeof payload.exp !== "number" || payload.exp < now) return null;
+  return payload.email || payload.common_name || "unknown";
+}
+
+// ---------- helpers ----------
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "content-type": "application/json;charset=UTF-8", "cache-control": "no-store" },
+  });
+}
+
+async function sha512(text) {
+  const d = await crypto.subtle.digest("SHA-512", new TextEncoder().encode(text));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function randomCode(len = 6) {
+  const bytes = crypto.getRandomValues(new Uint8Array(len));
+  let out = "";
+  for (const b of bytes) out += CODE_CHARS[b % CODE_CHARS.length];
+  return out;
+}
+
+function validateDestination(raw) {
+  let u;
+  try {
+    u = new URL(String(raw).trim());
+  } catch {
+    return { error: "Not a valid URL." };
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return { error: "Only http(s) URLs are allowed." };
+  if (u.username || u.password) return { error: "URLs with embedded credentials are not allowed." };
+  const host = u.hostname.toLowerCase();
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.startsWith("[")) return { error: "IP-address URLs are not allowed." };
+  if (!host.includes(".")) return { error: "Invalid host." };
+  if (BLOCKED_HOST_SUFFIXES.some((s) => host === s || host.endsWith("." + s)))
+    return { error: `Links to ${host} are not allowed (shortener / dynamic DNS).` };
+  return { url: u.toString() };
+}
+
+// ---------- handlers ----------
+async function createLink(request, env, email) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: "Expected JSON body {\"url\": \"...\"}." }, 400);
+  }
+  const v = validateDestination(body?.url);
+  if (v.error) return json({ ok: false, error: v.error }, 400);
+
+  const hash = await sha512(v.url);
+  const existing = await env.LINKS.get(hash);
+  if (existing && CODE_RE.test(existing) && (await env.LINKS.get(existing)) === v.url) {
+    return json({ ok: true, code: existing, short: `https://u.bo.ge/${existing}`, reused: true });
+  }
+
+  for (let i = 0; i < 5; i++) {
+    const code = randomCode();
+    if ((await env.LINKS.get(code)) !== null) continue;
+    await env.LINKS.put(code, v.url, {
+      metadata: { by: email, at: new Date().toISOString() },
+    });
+    await env.LINKS.put(hash, code);
+    console.log(JSON.stringify({ event: "link_created", code, url: v.url, by: email }));
+    return json({ ok: true, code, short: `https://u.bo.ge/${code}` });
+  }
+  return json({ ok: false, error: "Could not allocate a code, try again." }, 500);
+}
+
+async function redirect(code, requestURL, env) {
+  const target = await env.LINKS.get(code);
+  if (!target) return notFound();
+  let location = target;
+  // Keep extra query params working (e.g. utm tags) but merge them properly.
+  if (requestURL.search) {
+    try {
+      const dest = new URL(target);
+      for (const [k, v] of requestURL.searchParams) dest.searchParams.append(k, v);
+      location = dest.toString();
+    } catch {
+      location = target;
     }
-    
-    const html404 = `<!DOCTYPE html>
-    <body>
-      <h1>404 Not Found.</h1>
-      <p>The url you visit is not found.</p>
-      <a href="https://github.com/xyTom/Url-Shorten-Worker/" target="_self">Fork me on GitHub</a>
-    </body>`
-    
-    let response_header={
-      "content-type": "text/html;charset=UTF-8",
-    } 
-    
-    if (config.cors=="on"){
-      response_header={
-      "content-type": "text/html;charset=UTF-8",
-      "Access-Control-Allow-Origin":"*",
-      "Access-Control-Allow-Methods": "POST",
+  }
+  return new Response(null, { status: 302, headers: { Location: location, "cache-control": "no-store" } });
+}
+
+function notFound() {
+  return new Response(
+    `<!doctype html><meta charset="utf-8"><title>Not found</title><body style="font-family:system-ui;padding:40px"><h1>404</h1><p>This short link does not exist.</p></body>`,
+    { status: 404, headers: { "content-type": "text/html;charset=UTF-8" } }
+  );
+}
+
+const HOME_HTML = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>u.bo.ge</title><body style="font-family:system-ui;padding:40px;max-width:640px;margin:auto">
+<h1>u.bo.ge</h1><p>Private link shortener of BackOffice. Short links are created by staff only.</p>
+<p>To report abuse of a u.bo.ge link, write to <a href="mailto:info@backoffice.ge">info@backoffice.ge</a>.</p></body>`;
+
+const ADMIN_HTML = (email) => `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>u.bo.ge admin</title>
+<style>
+:root{--bg:#fff;--fg:#111;--muted:#666;--line:#ddd;--accent:#1a5fff}
+@media (prefers-color-scheme:dark){:root{--bg:#111;--fg:#eee;--muted:#999;--line:#333;--accent:#5b8cff}}
+body{background:var(--bg);color:var(--fg);font-family:system-ui;max-width:640px;margin:auto;padding:32px 16px}
+input{width:100%;box-sizing:border-box;padding:12px;font-size:16px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
+button{margin-top:12px;padding:12px 20px;font-size:16px;border:0;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
+#out{margin-top:20px;font-size:18px;word-break:break-all}.muted{color:var(--muted);font-size:14px}.err{color:#d33}
+</style></head><body>
+<h1>Create short link</h1><p class="muted">Signed in as ${email.replace(/[<>&"]/g, "")}</p>
+<form id="f"><input id="u" type="url" placeholder="https://..." required autofocus><button>Shorten</button></form>
+<div id="out"></div>
+<script>
+document.getElementById('f').onsubmit=async e=>{e.preventDefault();const o=document.getElementById('out');o.textContent='...';
+const r=await fetch('/admin/api/shorten',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url:document.getElementById('u').value})});
+const j=await r.json().catch(()=>({ok:false,error:'HTTP '+r.status}));
+if(j.ok){o.className='';o.innerHTML='';const a=document.createElement('a');a.href=j.short;a.textContent=j.short;o.appendChild(a);navigator.clipboard?.writeText(j.short).catch(()=>{});}
+else{o.className='err';o.textContent=j.error||'Error';}};
+</script></body></html>`;
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // ---- locked area ----
+    if (path === "/admin" || path.startsWith("/admin/")) {
+      const email = await verifyAccess(request, env).catch(() => null);
+      if (!email) return json({ ok: false, error: "Login required." }, 403);
+      if (path === "/admin" || path === "/admin/") {
+        return new Response(ADMIN_HTML(email), {
+          headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store" },
+        });
       }
+      if (path === "/admin/api/shorten" && request.method === "POST") return createLink(request, env, email);
+      return json({ ok: false, error: "Not found." }, 404);
     }
-    
-    async function randomString(len) {
-    　　len = len || 6;
-    　　let $chars = 'ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678';    /****默认去掉了容易混淆的字符oOLl,9gq,Vv,Uu,I1****/
-    　　let maxPos = $chars.length;
-    　　let result = '';
-    　　for (i = 0; i < len; i++) {
-    　　　　result += $chars.charAt(Math.floor(Math.random() * maxPos));
-    　　}
-    　　return result;
+
+    // ---- public area: redirects only ----
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return json({ ok: false, error: "Link creation requires login at https://u.bo.ge/admin" }, 403);
     }
-    
-    async function sha512(url){
-        url = new TextEncoder().encode(url)
-    
-        const url_digest = await crypto.subtle.digest(
-          {
-            name: "SHA-512",
-          },
-          url, // The data you want to hash as an ArrayBuffer
-        )
-        const hashArray = Array.from(new Uint8Array(url_digest)); // convert buffer to byte array
-        const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-        //console.log(hashHex)
-        return hashHex
+    if (path === "/" || path === "") {
+      return new Response(HOME_HTML, { headers: { "content-type": "text/html;charset=UTF-8" } });
     }
-    async function checkURL(URL){
-        let str=URL;
-        let Expression=/http(s)?:\/\/([\w-]+\.)+[\w-]+(\/[\w- .\/?%&=]*)?/;
-        let objExp=new RegExp(Expression);
-        if(objExp.test(str)==true){
-          if (str[0] == 'h')
-            return true;
-          else
-            return false;
-        }else{
-            return false;
-        }
-    } 
-    async function save_url(URL){
-        let random_key=await randomString()
-        let is_exist=await LINKS.get(random_key)
-        console.log(is_exist)
-        if (is_exist == null)
-            return await LINKS.put(random_key, URL),random_key
-        else
-            save_url(URL)
-    }
-    async function is_url_exist(url_sha512){
-      let is_exist = await LINKS.get(url_sha512)
-      console.log(is_exist)
-      if (is_exist == null) {
-        return false
-      }else{
-        return is_exist
-      }
-    }
-    async function is_url_safe(url){
-    
-      let raw = JSON.stringify({"client":{"clientId":"Url-Shorten-Worker","clientVersion":"1.0.7"},"threatInfo":{"threatTypes":["MALWARE","SOCIAL_ENGINEERING","POTENTIALLY_HARMFUL_APPLICATION","UNWANTED_SOFTWARE"],"platformTypes":["ANY_PLATFORM"],"threatEntryTypes":["URL"],"threatEntries":[{"url":url}]}});
-    
-      let requestOptions = {
-        method: 'POST',
-        body: raw,
-        redirect: 'follow'
-      };
-    
-      result = await fetch("https://safebrowsing.googleapis.com/v4/threatMatches:find?key="+config.safe_browsing_api_key, requestOptions)
-      result = await result.json()
-      console.log(result)
-      if (Object.keys(result).length === 0){
-        return true
-      }else{
-        return false
-      }
-    }
-    async function handleRequest(request) {
-      console.log(request)
-      if (request.method === "POST") {
-        let req=await request.json()
-        console.log(req["url"])
-        if(!await checkURL(req["url"])){
-        return new Response(`{"status":500,"key":": Error: Url illegal."}`, {
-          headers: response_header,
-        })}
-        let stat,random_key
-        if (config.unique_link){
-          let url_sha512 = await sha512(req["url"])
-          let url_key = await is_url_exist(url_sha512)
-          if(url_key){
-            random_key = url_key
-          }else{
-            stat,random_key=await save_url(req["url"])
-            if (typeof(stat) == "undefined"){
-              console.log(await LINKS.put(url_sha512,random_key))
-            }
-          }
-        }else{
-          stat,random_key=await save_url(req["url"])
-        }
-        console.log(stat)
-        if (typeof(stat) == "undefined"){
-          return new Response(`{"status":200,"key":"/`+random_key+`"}`, {
-          headers: response_header,
-        })
-        }else{
-          return new Response(`{"status":200,"key":": Error:Reach the KV write limitation."}`, {
-          headers: response_header,
-        })}
-      }else if(request.method === "OPTIONS"){  
-          return new Response(``, {
-          headers: response_header,
-        })
-    
-      }
-    
-      const requestURL = new URL(request.url)
-      const path = requestURL.pathname.split("/")[1]
-      const params = requestURL.search;
-    
-      console.log(path)
-      if(!path){
-    
-        const html= await fetch("https://shortner-7bn.pages.dev")
-        
-        return new Response(await html.text(), {
-        headers: {
-          "content-type": "text/html;charset=UTF-8",
-        },
-      })
-      }
-    
-      const value = await LINKS.get(path);
-      let location ;
-    
-      if(params) {
-        location = value + params
-      } else {
-          location = value
-      }
-      console.log(value)
-      
-    
-      if (location) {
-        if (config.safe_browsing_api_key){
-          if(!(await is_url_safe(location))){
-            let warning_page = await fetch("https://shortner-7bn.pages.dev/safe-browsing.html")
-            warning_page =await warning_page.text()
-            warning_page = warning_page.replace(/{Replace}/gm, location)
-            return new Response(warning_page, {
-              headers: {
-                "content-type": "text/html;charset=UTF-8",
-              },
-            })
-          }
-        }
-        if (config.no_ref=="on"){
-          let no_ref= await fetch("https://shortner-7bn.pages.dev/no-ref.html")
-          no_ref=await no_ref.text()
-          no_ref=no_ref.replace(/{Replace}/gm, location)
-          return new Response(no_ref, {
-          headers: {
-            "content-type": "text/html;charset=UTF-8",
-          },
-        })
-        }else{
-          return Response.redirect(location, 302)
-        }
-        
-      }
-      // If request not in kv, return 404
-      return new Response(html404, {
-        headers: {
-          "content-type": "text/html;charset=UTF-8",
-        },
-        status: 404
-      })
-    }
-    
-    
-    
-    addEventListener("fetch", async event => {
-      event.respondWith(handleRequest(event.request))
-    })
+    const code = path.split("/")[1];
+    if (!CODE_RE.test(code)) return notFound();
+    return redirect(code, url, env);
+  },
+};
